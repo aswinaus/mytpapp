@@ -1,0 +1,517 @@
+﻿@page "/"
+@using Azure.AI.OpenAI;
+@using Azure;
+@using Markdig;
+@using AzureOpenAIChat.Data;
+@using AzureOpenAIChat.Models;
+@using AzureOpenAIChat.Models.DTO;
+@using AzureOpenAIChat.Pages.Dialogs;
+@using System.Text.RegularExpressions;
+@inject IJSRuntime _jsRuntime
+@inject IConfiguration _configuration
+@inject NotificationService NotificationService
+@inject DialogService dialogService
+@*
+    Using OwningComponentBase ensures that the service and related services
+    that share its scope are disposed with the component.
+    Otherwise DbContext in ForecastService will live for the life of the
+    connection, which may be problematic if clients stay
+    connected for a long time.
+    We access WeatherForecastService using @Service
+*@
+@inherits OwningComponentBase<AzureOpenAIChatSQLVectorService>
+<PageTitle>Index</PageTitle>
+<style>
+    textarea {
+        border: 1px dashed #888;
+        border-radius: 5px;
+        width: 80%;
+        overflow: auto;
+        background: #f7f7f7
+    }
+
+    /* improved CSS for speech bubbles */
+
+    .assistant, .user {
+        position: relative;
+        font-family: arial;
+        font-size: 1.1em;
+        border-radius: 10px;
+        padding: 20px;
+        margin-bottom: 20px;
+    }
+
+        .assistant:after, .user:after {
+            content: '';
+            border: 20px solid transparent;
+            position: absolute;
+            margin-top: -30px;
+        }
+
+    .user {
+        background: #03a9f4;
+        color: #fff;
+        margin-left: 20%;
+        margin-right: 100px;
+        top: 30%;
+        text-align: right;
+    }
+
+    .assistant {
+        background: #4CAF50;
+        color: #fff;
+        margin-left: 100px;
+        margin-right: 20%;
+    }
+
+    .user:after {
+        border-left-color: #03a9f4;
+        border-right: 0;
+        right: -20px;
+    }
+
+    .assistant:after {
+        border-right-color: #4CAF50;
+        border-left: 0;
+        left: -20px;
+    }
+
+    .msg {
+        font-size: medium;
+    }
+</style>
+<h1>Blazor ChatGPT</h1>
+
+
+<RadzenTabs RenderMode="TabRenderMode.Client">
+    <Tabs>
+        <RadzenTabsItem Text="Chat">
+
+            <div id="chatcontainer" style="height:550px; width:100%; overflow: scroll;">
+                @foreach (var item in ChatMessages)
+                {
+                    <div>
+                        @if (item.Role == ChatRole.User)
+                        {
+                            <div style="float: right; margin-right: 20px; margin-top: 10px">
+                                <b>Human</b>
+                            </div>
+                            <div class="@item.Role">
+                                <div class="msg">
+                                    @item.Content
+                                </div>
+                            </div>
+                        }
+
+                        @if (item.Role == ChatRole.Assistant)
+                        {
+                            <div style="float: left; margin-left: 20px; margin-top: 10px">
+                                <b>ChatGPT&nbsp;&nbsp;</b>
+                            </div>
+                            <div class="@item.Role">
+                                <div class="msg">
+                                    @if (item.Content != null)
+                                    {
+                                        @((MarkupString)item.Content.ToHtml())
+                                    }
+                                </div>
+                            </div>
+                        }
+                    </div>
+                }
+            </div>
+            @if (!Processing)
+            {
+                <textarea rows="3" @bind="prompt" />
+                <br />
+                <button class="btn btn-primary"
+                @onclick="CallSearchData">
+                    Call ChatGPT
+                </button>
+                <span>&nbsp;</span>
+                <button class="btn btn-info"
+                @onclick="RestartChatGPT">
+                    Restart
+                </button>
+            }
+            else
+            {
+                <br>
+                <h4>Processing...</h4>
+            }
+
+        </RadzenTabsItem>
+        <RadzenTabsItem Text="Search Results">
+            <RadzenDataGrid Data="@similarities" TItem="ArticleResultsDTO"
+                            AllowFiltering="true" AllowSorting="true" AllowPaging="true">
+                <Columns>
+                    <RadzenDataGridColumn TItem="ArticleResultsDTO"
+                                          Property="Article" Title="Article" Width="30%">
+                    </RadzenDataGridColumn>
+                    <RadzenDataGridColumn TItem="ArticleResultsDTO"
+                                          Property="Sequence" Title="#" Width="10%">
+                    </RadzenDataGridColumn>
+                    <RadzenDataGridColumn TItem="ArticleResultsDTO"
+                                          Property="Contents" Title="Content">
+                        <Template Context="data">
+                            <p style="white-space:pre-wrap">@data.Contents</p>
+                        </Template>
+                    </RadzenDataGridColumn>
+                    <RadzenDataGridColumn TItem="ArticleResultsDTO"
+                                          Property="Match" Title="%"
+                                          FormatString="{0:P}" Width="10%">
+                    </RadzenDataGridColumn>
+                </Columns>
+            </RadzenDataGrid>
+        </RadzenTabsItem>
+    </Tabs>
+</RadzenTabs>
+
+<br /><p style="color:red">@ErrorMessage</p>
+@code {
+    string Endpoint = "";
+    string DeploymentOrModelName = "";
+    string Key = "";
+
+    List<ChatMessage> ChatMessages = new List<ChatMessage>();
+    string prompt = "";
+    string ErrorMessage = "";
+    bool Processing = false;
+
+    // Declare an embedding collection and a list to store similarities
+    List<ArticleResultsDTO> similarities = new List<ArticleResultsDTO>();
+
+    protected override void OnInitialized()
+    {
+        // Get the Azure OpenAI Service configuration values
+        Endpoint =
+        _configuration["AzureOpenAIServiceOptions:Endpoint"] ?? "";
+
+        DeploymentOrModelName =
+        _configuration["AzureOpenAIServiceOptions:DeploymentOrModelName"] ?? "";
+
+        Key =
+        _configuration["AzureOpenAIServiceOptions:Key"] ?? "";
+
+        RestartChatGPT();
+    }
+
+    protected override async Task
+    OnAfterRenderAsync(bool firstRender)
+    {
+        try
+        {
+            await _jsRuntime.InvokeAsync<string>(
+                "ScrollToBottom", "chatcontainer"
+            );
+        }
+        catch
+        {
+            // do nothing if this fails
+        }
+    }
+
+    void RestartChatGPT()
+    {
+        ErrorMessage = "";
+        prompt = "How can I bring my own data to Azure OpenAI?";
+
+        // Create a new list of ChatPrompt objects and initialize it with the
+        // system's introductory message
+        ChatMessages = new List<ChatMessage>();
+        string SystemMessage = "You are helpful Assistant.";
+        SystemMessage += "You will always reply with a Markdown formatted response.";
+
+        ChatMessages.Add(
+            new ChatMessage(
+            ChatRole.System,
+            SystemMessage)
+        );
+
+        StateHasChanged();
+    }
+
+    async Task CallSearchData()
+    {
+        // Set the in-progress flag to true
+        Processing = true;
+
+        // Notify the framework that the state has changed and the UI should be updated
+        StateHasChanged();
+
+        try
+        {
+            similarities.Clear();
+
+            // Create a new OpenAIClient object
+            // with the provided API key and Endpoint
+            OpenAIClient openAIClient = new OpenAIClient(
+                new Uri(Endpoint),
+                new AzureKeyCredential(Key));
+
+            // Get embeddings for the search text
+            var SearchEmbedding =
+            openAIClient.GetEmbeddings(
+                DeploymentOrModelName,
+                new EmbeddingsOptions(prompt)
+            );
+
+            // Get embeddings as an array of floats
+            var EmbeddingVectors =
+                SearchEmbedding.Value.Data[0].Embedding
+                .Select(d => (float)d).ToArray();
+
+            // Loop through the embeddings
+            List<VectorData> AllVectors = new List<VectorData>();
+            for (int i = 0; i < EmbeddingVectors.Length; i++)
+            {
+                var embeddingVector = new VectorData
+                    {
+                        VectorValue = EmbeddingVectors[i]
+                    };
+
+                AllVectors.Add(embeddingVector);
+            }
+
+            // Convert the floats to a single string to pass to the function
+            var VectorsForSearchText =
+            "[" + string.Join(",", AllVectors.Select(x => x.VectorValue)) + "]";
+
+            // Call the SQL function to get the similar content articles
+            var SimularContentArticles =
+            @Service.GetSimilarContentArticles(VectorsForSearchText);
+
+            // Loop through SimularContentArticles
+            foreach (var Article in SimularContentArticles)
+            {
+                // Add to similarities collection
+                similarities.Add(
+                    new ArticleResultsDTO()
+                        {
+                            Article = Article.ArticleName,
+                            Sequence = Article.ArticleSequence,
+                            Contents = Article.ArticleContent,
+                            Match = Article.cosine_distance ?? 0
+                        }
+                    );
+            }
+
+            // Sort the results by similarity in descending order
+            similarities.Sort((a, b) => b.Match.CompareTo(a.Match));
+
+            // Take the top 10 results
+            similarities = similarities.Take(10).ToList();
+
+            // Sort by the first colum then the second column
+            similarities.Sort((a, b) => a.Sequence.CompareTo(b.Sequence));
+            similarities.Sort((a, b) => a.Article.CompareTo(b.Article));
+
+            // Call Azure OpenAI API
+            await CallChatGPT();
+        }
+        catch (Exception ex)
+        {
+            // Create an error notification message
+            var Notification = new NotificationMessage()
+                {
+                    Severity = NotificationSeverity.Error,
+                    Summary = "Error",
+                    Detail = ex.Message,
+                    Duration = 40000
+                };
+
+            // Show the notification
+            NotificationService.Notify(Notification);
+
+            // Set the in-progress flag to false
+            Processing = false;
+
+            // Notify the framework that the state has changed
+            // and the UI should be updated
+            StateHasChanged();
+        }
+    }
+
+    async Task CallChatGPT()
+    {
+        // Set the in-progress flag to true
+        Processing = true;
+
+        // Notify the framework that the state has changed and the UI should be updated
+        StateHasChanged();
+
+        try
+        {
+            // Concatonate colum 3 from similarities collection into Knowledge
+            string ExistingKnowledge = "";
+            foreach (var item in similarities)
+            {
+                ExistingKnowledge +=
+                $"#Article: {item.Article} #Article Contents: {item.Contents}";
+            }
+
+            // This model's maximum context length is 8192 tokens
+            // Remove old chat messages to avoid exceeding the limit
+            RemoveOldChatMessags();
+
+            // Create a new OpenAIClient object
+            // with the provided API key and Endpoint
+            OpenAIClient client = new OpenAIClient(
+                new Uri(Endpoint),
+                new AzureKeyCredential(Key));
+
+            // Add the new message to chatMessages
+            ChatMessages.Add(new ChatMessage(ChatRole.User, prompt));
+
+            // Add the existing knowledge to the chatMessages list
+            ChatMessages.Add(new ChatMessage(ChatRole.System, GetInstruction(ExistingKnowledge)));
+
+            // Create a new ChatCompletionsOptions object
+            var chatCompletionsOptions = new ChatCompletionsOptions()
+                {
+                    Temperature = (float)0.0,
+                    MaxTokens = 2000,
+                    NucleusSamplingFactor = (float)1.00,
+                    FrequencyPenalty = 0,
+                    PresencePenalty = 0,
+                };
+
+            // Add the Chat messages to the chatCompletionsOptions object
+            foreach (var message in ChatMessages)
+            {
+                chatCompletionsOptions.Messages.Add(message);
+            }
+
+            // Call the GetChatCompletionsAsync method
+            Response<ChatCompletions> responseWithoutStream =
+            await client.GetChatCompletionsAsync(
+                "gpt35",
+                chatCompletionsOptions);
+
+            // Get the ChatCompletions object from the response
+            ChatCompletions result = responseWithoutStream.Value;
+
+            // Create a new Message object with the response and other details
+            // and add it to the messages list
+            var choice = result.Choices.FirstOrDefault();
+
+            if (choice != null)
+            {
+                if (choice.Message != null)
+                {
+                    ChatMessages.Add(choice.Message);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            // Create an error notification message
+            var Notification = new NotificationMessage()
+                {
+                    Severity = NotificationSeverity.Error,
+                    Summary = "Error",
+                    Detail = ex.Message,
+                    Duration = 40000
+                };
+            // Show the notification
+            NotificationService.Notify(Notification);
+        }
+
+        // Set the in-progress flag to false
+        Processing = false;
+
+        // Clear the prompt
+        prompt = "";
+
+        // Notify the framework that the state has changed
+        // and the UI should be updated
+        StateHasChanged();
+    }
+
+    public string GetInstruction(string Knowledge)
+    {
+        string instruction = $@"
+        Answer questions using the given knowledge ONLY.
+        For tabular information return it as an HTML table.
+        Always return markdown format.
+        Each knowledge has a #Article: source name and an #Article Contents: with the actual information
+        Do not return the ##Knowledge: section only return the ##Answer: section
+        Always include the source name for each knowledge you use in the answer.
+        Don't cite knowledge that is not available in the knowledge list.
+        If you cannot answer using the knowledge list only, say you don't know.
+
+        You have this knowledge available: {Knowledge}
+
+        ### EXAMPLE 1
+        Question: 'What Microsoft Blazor?'
+
+        ##Knowledge:
+        #Article: Blazor One #Article Contents: Blazor allows you to build web apps.
+        #Article: Blazor One #Article Contents: Both client and server code is written in C#, allowing you to share code and libraries.
+        #Article: Blazor Two #Article Contents: It uses C# instead of JavaScript allowing you to share code and libraries.
+
+        ##Answer:
+        Blazor apps are composed of reusable web UI components implemented using C#, HTML, and CSS.
+        Both client and server code is written in C#, allowing you to share code and libraries.
+
+        References: [Blazor One], [Blazor Two]
+
+        ### EXAMPLE 2
+        Question: 'What happens in a performance review'
+
+        ##Knowledge:
+
+        ##Answer:
+        I don't know
+        ###";
+        return instruction.Trim();
+    }
+
+    // Utility
+
+    int CurrentWordCount = 0;
+    private void RemoveOldChatMessags()
+    {
+        // Copy current chat messages to a new list
+        var CopyOfChatMessages = new List<ChatMessage>(ChatMessages);
+
+        // Clear the chat messages
+        ChatMessages = new List<ChatMessage>();
+
+        // Create a new LinkedList of ChatMessages
+        LinkedList<ChatMessage> ChatPromptsLinkedList = new LinkedList<ChatMessage>();
+
+        // Loop through the ChatMessages and add them to the LinkedList
+        foreach (var item in CopyOfChatMessages)
+        {
+            ChatPromptsLinkedList.AddLast(item);
+        }
+
+        // Set the current word count to 0
+        CurrentWordCount = 0;
+
+        // Reverse the chat messages to start from the most recent messages
+        foreach (var chat in ChatPromptsLinkedList.Reverse())
+        {
+            if (chat.Content != null)
+            {
+                int promptWordCount = chat.Content.Split(
+                    new char[] { ' ', '\t', '\n', '\r' },
+                    StringSplitOptions.RemoveEmptyEntries).Length;
+
+                if (CurrentWordCount + promptWordCount >= 1000)
+                {
+                    // This message would cause the total to exceed 1000 words,
+                    // so break out of the loop
+                    break;
+                }
+
+                // Add to ChatMessages
+                ChatMessages.Insert(0, chat);
+
+                // Update the current word count
+                CurrentWordCount += promptWordCount;
+            }
+        }
+    }
+}
