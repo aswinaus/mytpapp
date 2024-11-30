@@ -1,4 +1,4 @@
-OpenAI with RAG using AzureSQL as VectorDB
+**OpenAI with RAG using AzureSQL as VectorDB**
 
 My Transfer Pricing App - https://mytpapp.com
 Implement Retrieval Augemented Generation using Azure SQL as Vector Database with notion of building a successful model which aids in the benchmarking process within Transfer Pricing.
